@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.nanobot import Nanobot, RunResult
+from nanobot.nanobot import Nanobot, RunResult, SessionInfo, SessionSnapshot
 
 
 def _write_config(tmp_path: Path, overrides: dict | None = None) -> Path:
@@ -167,6 +167,8 @@ def test_import_from_top_level():
 
     assert nanobot.Nanobot is Nanobot
     assert nanobot.RunResult is RunResult
+    assert nanobot.SessionInfo is SessionInfo
+    assert nanobot.SessionSnapshot is SessionSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +250,81 @@ async def test_run_no_iterations_leaves_defaults_empty(tmp_path):
     result = await bot.run("hi")
     assert result.tools_used == []
     assert result.messages == []
+    assert result.usage == {}
+    assert result.stop_reason is None
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_run_populates_observability_fields(tmp_path):
+    from nanobot.agent.hook import AgentRunHookContext
+    from nanobot.bus.events import OutboundMessage
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    async def fake_process_direct(message, *, session_key):
+        ctx = AgentRunHookContext(
+            messages=[
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "done"},
+            ],
+            final_content="done",
+            tools_used=["read_file"],
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            stop_reason="completed",
+            error=None,
+            tool_events=[{"tool": "read_file", "status": "ok"}],
+        )
+        for h in bot._loop._extra_hooks:
+            await h.after_run(ctx)
+        return OutboundMessage(
+            channel="cli",
+            chat_id="direct",
+            content="done",
+            metadata={"latency_ms": 42},
+        )
+
+    bot._loop.process_direct = fake_process_direct
+    result = await bot.run("work")
+
+    assert result.content == "done"
+    assert result.tools_used == ["read_file"]
+    assert result.usage == {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    assert result.stop_reason == "completed"
+    assert result.error is None
+    assert result.metadata == {"latency_ms": 42}
+
+
+@pytest.mark.asyncio
+async def test_run_forwards_non_default_runtime_options(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    bot._loop.process_direct = AsyncMock(
+        return_value=OutboundMessage(channel="sdk", chat_id="chat-a", content="ok"),
+    )
+
+    await bot.run(
+        "hi",
+        session_key="sdk:chat-a",
+        channel="sdk",
+        chat_id="chat-a",
+        sender_id="alice",
+        media=["/tmp/image.png"],
+        ephemeral=True,
+    )
+
+    bot._loop.process_direct.assert_awaited_once_with(
+        "hi",
+        session_key="sdk:chat-a",
+        channel="sdk",
+        chat_id="chat-a",
+        sender_id="alice",
+        media=["/tmp/image.png"],
+        ephemeral=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -322,10 +399,133 @@ async def test_sdk_capture_prefers_run_level_snapshot():
     await hook.after_run(AgentRunHookContext(
         messages=final_messages,
         tools_used=["read_file"],
+        usage={"total_tokens": 3},
+        stop_reason="completed",
     ))
 
     assert hook.tools_used == ["read_file"]
     assert hook.messages == final_messages
+    assert hook.usage == {"total_tokens": 3}
+    assert hook.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_sessions_ingest_imports_transcript_without_running_model(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    bot._loop.process_direct = AsyncMock()
+    bot._loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
+
+    snapshot = await bot.sessions.ingest(
+        "sdk:history",
+        [
+            {
+                "role": "user",
+                "content": "I graduated with a Business Administration degree.",
+                "timestamp": "2023/05/30 (Tue) 17:27",
+                "source_session_id": "answer_1",
+            },
+            {
+                "role": "assistant",
+                "content": "Congratulations on your degree.",
+                "timestamp": "2023/05/30 (Tue) 17:27",
+            },
+        ],
+        metadata={"title": "LongMemEval case"},
+        source="longmemeval",
+    )
+
+    assert isinstance(snapshot, SessionSnapshot)
+    assert snapshot.key == "sdk:history"
+    assert snapshot.metadata["title"] == "LongMemEval case"
+    assert snapshot.messages[0]["role"] == "user"
+    assert snapshot.messages[0]["timestamp"] == "2023/05/30 (Tue) 17:27"
+    assert snapshot.messages[0]["source_session_id"] == "answer_1"
+    assert snapshot.messages[0]["source"] == "longmemeval"
+    assert snapshot.messages[1]["source"] == "longmemeval"
+    bot._loop.process_direct.assert_not_called()
+    bot._loop.consolidator.maybe_consolidate_by_tokens.assert_not_called()
+
+    reloaded = bot.sessions.get("sdk:history")
+    assert reloaded is not None
+    assert reloaded.messages == snapshot.messages
+
+
+@pytest.mark.asyncio
+async def test_sessions_ingest_validates_message_shape(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    with pytest.raises(ValueError, match="role"):
+        await bot.sessions.ingest("sdk:bad", [{"content": "missing role"}])
+
+    with pytest.raises(ValueError, match="unsupported message role"):
+        await bot.sessions.ingest("sdk:bad", [{"role": "developer", "content": "nope"}])
+
+
+@pytest.mark.asyncio
+async def test_session_helpers_get_list_export_clear_delete_flush(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    await bot.sessions.ingest("sdk:first", [{"role": "user", "content": "hello"}])
+
+    listed = bot.sessions.list()
+    assert listed
+    assert isinstance(listed[0], SessionInfo)
+    assert {row.key for row in listed} == {"sdk:first"}
+
+    exported = bot.sessions.export("sdk:first")
+    assert exported is not None
+    exported.messages[0]["content"] = "mutated copy"
+    assert bot.sessions.get("sdk:first").messages[0]["content"] == "hello"
+
+    cleared = bot.sessions.clear("sdk:first")
+    assert cleared.messages == []
+    assert bot.sessions.flush() >= 1
+    assert bot.sessions.delete("sdk:first") is True
+    assert bot.sessions.get("sdk:first") is None
+
+
+def test_memory_helpers_read_write_append_and_filter_history(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    assert bot.memory.read() == ""
+    bot.memory.write("# Memory\n- User likes concise APIs.")
+    assert "concise APIs" in bot.memory.read()
+
+    c1 = bot.memory.append_history("general event")
+    c2 = bot.memory.append_history("session event", session_key="sdk:history")
+
+    all_entries = bot.memory.read_history()
+    assert [entry["cursor"] for entry in all_entries] == [c1, c2]
+
+    session_entries = bot.memory.read_history(session_key="sdk:history")
+    assert len(session_entries) == 1
+    assert session_entries[0]["content"] == "session event"
+
+
+@pytest.mark.asyncio
+async def test_runtime_helpers_expose_model_workspace_and_compact(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    await bot.sessions.ingest("sdk:history", [{"role": "user", "content": "hello"}])
+
+    bot._loop.consolidator.maybe_consolidate_by_tokens = AsyncMock()
+    snapshot = await bot.runtime.compact_session("sdk:history")
+    assert snapshot.key == "sdk:history"
+    bot._loop.consolidator.maybe_consolidate_by_tokens.assert_awaited_once()
+    assert bot.runtime.model == bot._loop.model
+    assert bot.runtime.workspace == tmp_path
+
+    bot._loop.consolidator.compact_idle_session = AsyncMock(return_value="Summary.")
+    summary = await bot.runtime.compact_idle_session("sdk:history", max_suffix=4)
+    assert summary == "Summary."
+    bot._loop.consolidator.compact_idle_session.assert_awaited_once_with(
+        "sdk:history",
+        max_suffix=4,
+    )
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,8 @@ __logo__ = "🐈"
 _LAZY_EXPORTS = {
     "Nanobot": ".nanobot",
     "RunResult": ".nanobot",
+    "SessionInfo": ".nanobot",
+    "SessionSnapshot": ".nanobot",
 }
 
 
@@ -45,4 +47,4 @@ def __getattr__(name: str):
     return val
 
 
-__all__ = ["Nanobot", "RunResult"]
+__all__ = ["Nanobot", "RunResult", "SessionInfo", "SessionSnapshot"]

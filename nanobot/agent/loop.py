@@ -1744,6 +1744,7 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        sender_id: str = "user",
         media: list[str] | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
@@ -1754,7 +1755,7 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
+            channel=channel, sender_id=sender_id, chat_id=chat_id,
             content=content, media=media or [],
         )
         # Share the dispatch lock so direct calls serialize with bus turns.

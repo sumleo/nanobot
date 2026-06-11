@@ -1,6 +1,8 @@
 # Python SDK
 
-Use nanobot as a library — no CLI, no gateway, just Python.
+Use nanobot as a library — no CLI, no gateway, just Python. The SDK exposes
+the same agent runtime used by the CLI, plus stable helpers for sessions,
+memory, and compaction.
 
 Before debugging SDK code, prove the same config works from the CLI:
 
@@ -51,6 +53,41 @@ await bot.run("hi", session_key="user-alice")
 await bot.run("hi", session_key="task-42")
 ```
 
+### Import an existing transcript
+
+Use `bot.sessions.ingest()` when you already have a transcript and want it to
+become nanobot session history. Ingesting a transcript does not call the model,
+execute tools, trigger Dream, or compact automatically.
+
+```python
+await bot.sessions.ingest(
+    "eval:case-1",
+    [
+        {
+            "role": "user",
+            "content": "I graduated with a degree in Business Administration.",
+            "timestamp": "2023/05/30 (Tue) 17:27",
+            "source_session_id": "answer_280352e9",
+        },
+        {
+            "role": "assistant",
+            "content": "Congratulations on your degree.",
+            "timestamp": "2023/05/30 (Tue) 17:27",
+        },
+    ],
+    source="longmemeval",
+)
+
+await bot.runtime.compact_session("eval:case-1")
+
+result = await bot.run(
+    "Current Date: 2023/05/30 (Tue) 23:40\n"
+    "Question: What degree did I graduate with?",
+    session_key="eval:case-1",
+)
+print(result.content)
+```
+
 ### Attach hooks for observability
 
 Hooks let you inspect tool calls, streaming, and iteration state without modifying nanobot internals:
@@ -81,7 +118,7 @@ Create a `Nanobot` instance from a config file.
 
 Raises `FileNotFoundError` if an explicit config path does not exist.
 
-### `await bot.run(message, *, session_key="sdk:default", hooks=None)`
+### `await bot.run(...)`
 
 Run the agent once and return a `RunResult`.
 
@@ -89,6 +126,11 @@ Run the agent once and return a `RunResult`.
 |-------|------|---------|-------------|
 | `message` | `str` | *(required)* | The user message to process. |
 | `session_key` | `str` | `"sdk:default"` | Session identifier for conversation isolation. Different keys get independent history. |
+| `channel` | `str` | `"cli"` | Logical channel label used in runtime context. |
+| `chat_id` | `str` | `"direct"` | Logical chat identifier used in runtime context. |
+| `sender_id` | `str` | `"user"` | Logical sender identifier used in runtime context. |
+| `media` | `list[str] \| None` | `None` | Optional local media paths attached to the message. |
+| `ephemeral` | `bool` | `False` | Run without persisting the turn or compacting session history. |
 | `hooks` | `list[AgentHook] \| None` | `None` | Lifecycle hooks for this run only. |
 
 ### `await bot.aclose()`
@@ -105,8 +147,48 @@ async with Nanobot.from_config() as bot:
 | Field | Type | Description |
 |-------|------|-------------|
 | `content` | `str` | The agent's final text response. |
-| `tools_used` | `list[str]` | Reserved for richer SDK introspection; may be empty in current versions. |
-| `messages` | `list[dict]` | Reserved for richer SDK introspection; may be empty in current versions. |
+| `tools_used` | `list[str]` | Tool names used during the run. |
+| `messages` | `list[dict]` | Final message list from the run. |
+| `usage` | `dict[str, int]` | Token usage reported or estimated by the runtime. |
+| `stop_reason` | `str \| None` | Why the run stopped, such as `"completed"` or `"max_iterations"`. |
+| `error` | `str \| None` | Error text when the run failed inside the agent runtime. |
+| `metadata` | `dict` | Outbound metadata such as latency. |
+
+## Session, Memory, And Runtime Helpers
+
+### `bot.sessions`
+
+| Method | Description |
+|--------|-------------|
+| `await ingest(session_key, messages, metadata=None, source=None, save=True)` | Import existing transcript messages without running the model. |
+| `get(session_key)` | Return a `SessionSnapshot`, or `None` if missing. |
+| `list()` | Return compact `SessionInfo` rows. |
+| `export(session_key)` | Return a full `SessionSnapshot` suitable for JSON serialization. |
+| `clear(session_key)` | Clear and persist one session. |
+| `delete(session_key)` | Delete one session from disk and cache. |
+| `flush()` | Flush cached sessions to durable storage. |
+
+Ingested messages must include `role` and `content`. Roles may be `user`,
+`assistant`, `tool`, or `system`. Other fields, such as `timestamp`,
+`source_session_id`, or `source_date`, are persisted as message metadata.
+
+### `bot.memory`
+
+| Method | Description |
+|--------|-------------|
+| `read()` | Read `memory/MEMORY.md`. |
+| `write(text)` | Overwrite `memory/MEMORY.md`. |
+| `append_history(text, session_key=None)` | Append one `memory/history.jsonl` entry and return its cursor. |
+| `read_history(session_key=None)` | Read memory history entries, optionally filtered by session key. |
+
+### `bot.runtime`
+
+| Method / Property | Description |
+|-------------------|-------------|
+| `model` | Current runtime model name. |
+| `workspace` | Current runtime workspace path. |
+| `await compact_session(session_key)` | Run token/replay-window consolidation for a session. |
+| `await compact_idle_session(session_key, max_suffix=8)` | Run idle-session compaction and return its summary. |
 
 ## Hooks
 
