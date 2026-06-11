@@ -11,6 +11,8 @@ from typing import Any
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
+from nanobot.config.schema import Config, ModelPresetConfig
+from nanobot.providers.factory import ProviderSnapshot, build_provider_snapshot
 from nanobot.providers.image_generation import image_gen_provider_configs
 
 
@@ -431,8 +433,10 @@ class Nanobot:
         print(result.content)
     """
 
-    def __init__(self, loop: AgentLoop) -> None:
+    def __init__(self, loop: AgentLoop, *, config: Config | None = None) -> None:
         self._loop = loop
+        self._config = config
+        self._sdk_run_lock = asyncio.Lock()
         self.sessions = SessionClient(loop)
         self.memory = MemoryClient(loop)
         self.runtime = RuntimeClient(loop)
@@ -466,12 +470,73 @@ class Nanobot:
             kwargs["on_stream_end"] = on_stream_end
         return kwargs
 
+    @staticmethod
+    def _ensure_single_model_selector(
+        *,
+        model: str | None,
+        model_preset: str | None,
+    ) -> None:
+        if model is not None and model_preset is not None:
+            raise ValueError("model and model_preset are mutually exclusive")
+
+    def _model_override_snapshot(
+        self,
+        *,
+        model: str | None,
+        model_preset: str | None,
+    ) -> ProviderSnapshot | None:
+        self._ensure_single_model_selector(model=model, model_preset=model_preset)
+        if model_preset is not None:
+            return self._loop._build_model_preset_snapshot(model_preset)
+        if model is None:
+            return None
+
+        if self._config is not None:
+            base = self._config.resolve_preset(self._loop.model_preset)
+            preset = base.model_copy(update={"model": model, "provider": "auto"})
+            return build_provider_snapshot(self._config, preset=preset)
+
+        generation = getattr(self._loop.provider, "generation", None)
+        preset = ModelPresetConfig(
+            model=model,
+            provider="auto",
+            max_tokens=getattr(generation, "max_tokens", 8192),
+            context_window_tokens=self._loop.context_window_tokens,
+            temperature=getattr(generation, "temperature", 0.1),
+            reasoning_effort=getattr(generation, "reasoning_effort", None),
+        )
+        from nanobot.agent.model_presets import build_static_preset_snapshot
+
+        return build_static_preset_snapshot(self._loop.provider, "sdk:override", preset)
+
+    def _current_runtime_snapshot(self) -> ProviderSnapshot:
+        signature = self._loop._provider_signature
+        if signature is None:
+            signature = ("sdk:runtime", id(self._loop.provider), self._loop.model)
+        return ProviderSnapshot(
+            provider=self._loop.provider,
+            model=self._loop.model,
+            context_window_tokens=self._loop.context_window_tokens,
+            signature=signature,
+        )
+
+    def _restore_runtime_snapshot(
+        self,
+        snapshot: ProviderSnapshot,
+        *,
+        provider_signature: tuple[object, ...] | None,
+    ) -> None:
+        self._loop._apply_provider_snapshot(snapshot, publish_update=False)
+        self._loop._provider_signature = provider_signature
+
     @classmethod
     def from_config(
         cls,
         config_path: str | Path | None = None,
         *,
         workspace: str | Path | None = None,
+        model: str | None = None,
+        model_preset: str | None = None,
     ) -> Nanobot:
         """Create a Nanobot instance from a config file.
 
@@ -479,10 +544,12 @@ class Nanobot:
             config_path: Path to ``config.json``.  Defaults to
                 ``~/.nanobot/config.json``.
             workspace: Override the workspace directory from config.
+            model: Override the instance default model.
+            model_preset: Override the instance default model preset.
         """
         from nanobot.config.loader import load_config, resolve_config_env_vars
-        from nanobot.config.schema import Config
 
+        cls._ensure_single_model_selector(model=model, model_preset=model_preset)
         resolved: Path | None = None
         if config_path is not None:
             resolved = Path(config_path).expanduser().resolve()
@@ -494,12 +561,18 @@ class Nanobot:
             config.agents.defaults.workspace = str(
                 Path(workspace).expanduser().resolve()
             )
+        if model is not None:
+            config.agents.defaults.model_preset = None
+            config.agents.defaults.model = model
+            config.agents.defaults.provider = "auto"
+        elif model_preset is not None:
+            config.agents.defaults.model_preset = model_preset
 
         loop = AgentLoop.from_config(
             config,
             image_generation_provider_configs=image_gen_provider_configs(config),
         )
-        return cls(loop)
+        return cls(loop, config=config)
 
     async def run(
         self,
@@ -512,6 +585,8 @@ class Nanobot:
         media: list[str] | None = None,
         ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
+        model: str | None = None,
+        model_preset: str | None = None,
     ) -> RunResult:
         """Run the agent once and return the result.
 
@@ -525,26 +600,43 @@ class Nanobot:
             media: Optional local media paths attached to the message.
             ephemeral: If true, do not persist the turn or compact session history.
             hooks: Optional lifecycle hooks for this run.
+            model: Override the model for this run only.
+            model_preset: Override the model preset for this run only.
         """
         capture = SDKCaptureHook()
         prev = self._loop._extra_hooks
         base_hooks = list(hooks) if hooks is not None else list(prev or [])
-        self._loop._extra_hooks = [capture, *base_hooks]
-        kwargs = self._process_direct_kwargs(
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
-            sender_id=sender_id,
-            media=media,
-            ephemeral=ephemeral,
-        )
-        try:
-            response = await self._loop.process_direct(
-                message,
-                **kwargs,
+        override = self._model_override_snapshot(model=model, model_preset=model_preset)
+        async with self._sdk_run_lock:
+            restore = self._current_runtime_snapshot() if override is not None else None
+            restore_signature = self._loop._provider_signature
+            if override is not None:
+                self._loop._apply_provider_snapshot(
+                    override,
+                    publish_update=False,
+                    model_preset=model_preset,
+                )
+            self._loop._extra_hooks = [capture, *base_hooks]
+            kwargs = self._process_direct_kwargs(
+                session_key=session_key,
+                channel=channel,
+                chat_id=chat_id,
+                sender_id=sender_id,
+                media=media,
+                ephemeral=ephemeral,
             )
-        finally:
-            self._loop._extra_hooks = prev
+            try:
+                response = await self._loop.process_direct(
+                    message,
+                    **kwargs,
+                )
+            finally:
+                self._loop._extra_hooks = prev
+                if restore is not None:
+                    self._restore_runtime_snapshot(
+                        restore,
+                        provider_signature=restore_signature,
+                    )
 
         return _result_from_response(response, capture)
 
@@ -559,12 +651,15 @@ class Nanobot:
         media: list[str] | None = None,
         ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
+        model: str | None = None,
+        model_preset: str | None = None,
     ) -> RunStream:
         """Start a streamed run and return a handle for events and final result."""
         queue: asyncio.Queue[StreamEvent | object] = asyncio.Queue(maxsize=256)
         emitter = _SDKStreamEmitter(queue)
         stream_hook = _SDKStreamingHook(emitter)
         capture = SDKCaptureHook()
+        override = self._model_override_snapshot(model=model, model_preset=model_preset)
 
         async def _on_stream(delta: str) -> None:
             await emitter.text_delta(delta)
@@ -573,50 +668,68 @@ class Nanobot:
             await emitter.text_completed(resuming=resuming)
 
         async def _run() -> RunResult:
-            prev = self._loop._extra_hooks
-            base_hooks = list(hooks) if hooks is not None else list(prev or [])
-            self._loop._extra_hooks = [capture, stream_hook, *base_hooks]
-            kwargs = self._process_direct_kwargs(
-                session_key=session_key,
-                channel=channel,
-                chat_id=chat_id,
-                sender_id=sender_id,
-                media=media,
-                ephemeral=ephemeral,
-                on_stream=_on_stream,
-                on_stream_end=_on_stream_end,
-            )
-            await emitter.emit(StreamEvent(
-                type="run.started",
-                metadata={
-                    "session_key": session_key,
-                    "channel": channel,
-                    "chat_id": chat_id,
-                    "sender_id": sender_id,
-                },
-            ))
-            try:
-                response = await self._loop.process_direct(message, **kwargs)
-                await emitter.text_completed(resuming=False, force=False)
-                result = _result_from_response(response, capture)
+            async with self._sdk_run_lock:
+                prev = self._loop._extra_hooks
+                base_hooks = list(hooks) if hooks is not None else list(prev or [])
+                restore = self._current_runtime_snapshot() if override is not None else None
+                restore_signature = self._loop._provider_signature
+                if override is not None:
+                    self._loop._apply_provider_snapshot(
+                        override,
+                        publish_update=False,
+                        model_preset=model_preset,
+                    )
+                self._loop._extra_hooks = [capture, stream_hook, *base_hooks]
+                kwargs = self._process_direct_kwargs(
+                    session_key=session_key,
+                    channel=channel,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
+                    media=media,
+                    ephemeral=ephemeral,
+                    on_stream=_on_stream,
+                    on_stream_end=_on_stream_end,
+                )
                 await emitter.emit(StreamEvent(
-                    type="run.completed",
-                    content=result.content,
-                    result=result,
-                    usage=dict(result.usage),
-                    metadata=dict(result.metadata),
+                    type="run.started",
+                    metadata={
+                        "session_key": session_key,
+                        "channel": channel,
+                        "chat_id": chat_id,
+                        "sender_id": sender_id,
+                        "model": self._loop.model,
+                        "model_preset": (
+                            model_preset if model_preset is not None else self._loop.model_preset
+                        ),
+                    },
                 ))
-                return result
-            except Exception as exc:
-                await emitter.emit(StreamEvent(
-                    type="run.failed",
-                    error=str(exc),
-                    metadata={"exception_type": type(exc).__name__},
-                ))
-                raise
-            finally:
-                self._loop._extra_hooks = prev
-                await emitter.close()
+                try:
+                    response = await self._loop.process_direct(message, **kwargs)
+                    await emitter.text_completed(resuming=False, force=False)
+                    result = _result_from_response(response, capture)
+                    await emitter.emit(StreamEvent(
+                        type="run.completed",
+                        content=result.content,
+                        result=result,
+                        usage=dict(result.usage),
+                        metadata=dict(result.metadata),
+                    ))
+                    return result
+                except Exception as exc:
+                    await emitter.emit(StreamEvent(
+                        type="run.failed",
+                        error=str(exc),
+                        metadata={"exception_type": type(exc).__name__},
+                    ))
+                    raise
+                finally:
+                    self._loop._extra_hooks = prev
+                    if restore is not None:
+                        self._restore_runtime_snapshot(
+                            restore,
+                            provider_signature=restore_signature,
+                        )
+                    await emitter.close()
 
         task = asyncio.create_task(_run())
         return RunStream(task, queue)
@@ -632,6 +745,8 @@ class Nanobot:
         media: list[str] | None = None,
         ephemeral: bool = False,
         hooks: list[AgentHook] | None = None,
+        model: str | None = None,
+        model_preset: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream events for one agent turn."""
         run = await self.run_streamed(
@@ -643,6 +758,8 @@ class Nanobot:
             media=media,
             ephemeral=ephemeral,
             hooks=hooks,
+            model=model,
+            model_preset=model_preset,
         )
         async for event in run.stream_events():
             yield event

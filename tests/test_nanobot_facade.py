@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +24,17 @@ def _write_config(tmp_path: Path, overrides: dict | None = None) -> Path:
     return config_path
 
 
+def _fake_provider(name: str, *, max_tokens: int = 8192) -> MagicMock:
+    provider = MagicMock(name=name)
+    provider.get_default_model.return_value = name
+    provider.generation = SimpleNamespace(
+        max_tokens=max_tokens,
+        temperature=0.1,
+        reasoning_effort=None,
+    )
+    return provider
+
+
 def test_from_config_missing_file():
     with pytest.raises(FileNotFoundError):
         Nanobot.from_config("/nonexistent/config.json")
@@ -33,6 +45,50 @@ def test_from_config_creates_instance(tmp_path):
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
     assert bot._loop is not None
     assert bot._loop.workspace == tmp_path
+
+
+def test_from_config_accepts_default_model_override(tmp_path):
+    config_path = _write_config(tmp_path)
+
+    bot = Nanobot.from_config(
+        config_path,
+        workspace=tmp_path,
+        model="openai/gpt-4.1-mini",
+    )
+
+    assert bot.runtime.model == "openai/gpt-4.1-mini"
+    assert bot._loop.model_preset is None
+
+
+def test_from_config_accepts_default_model_preset(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        {
+            "modelPresets": {
+                "fast": {
+                    "model": "openai/gpt-4.1-mini",
+                    "provider": "openrouter",
+                }
+            }
+        },
+    )
+
+    bot = Nanobot.from_config(config_path, workspace=tmp_path, model_preset="fast")
+
+    assert bot.runtime.model == "openai/gpt-4.1-mini"
+    assert bot._loop.model_preset == "fast"
+
+
+def test_from_config_rejects_multiple_model_selectors(tmp_path):
+    config_path = _write_config(tmp_path)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Nanobot.from_config(
+            config_path,
+            workspace=tmp_path,
+            model="openai/gpt-4.1",
+            model_preset="fast",
+        )
 
 
 def test_from_config_default_path():
@@ -330,6 +386,87 @@ async def test_run_forwards_non_default_runtime_options(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_model_override_is_per_run_and_restores_default(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.providers.factory import ProviderSnapshot
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    original_provider = bot._loop.provider
+    original_model = bot._loop.model
+    original_signature = bot._loop._provider_signature
+    override_provider = _fake_provider("override-provider", max_tokens=2048)
+    override = ProviderSnapshot(
+        provider=override_provider,
+        model="openai/gpt-4.1-mini",
+        context_window_tokens=4096,
+        signature=("sdk", "override"),
+    )
+    bot._model_override_snapshot = MagicMock(return_value=override)
+
+    async def fake_process_direct(message, *, session_key):
+        assert bot._loop.provider is override_provider
+        assert bot._loop.runner.provider is override_provider
+        assert bot._loop.model == "openai/gpt-4.1-mini"
+        assert bot._loop.context_window_tokens == 4096
+        return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+    bot._loop.process_direct = fake_process_direct
+
+    result = await bot.run("hi", model="openai/gpt-4.1-mini")
+
+    assert result.content == "ok"
+    bot._model_override_snapshot.assert_called_once_with(
+        model="openai/gpt-4.1-mini",
+        model_preset=None,
+    )
+    assert bot._loop.provider is original_provider
+    assert bot._loop.runner.provider is original_provider
+    assert bot._loop.model == original_model
+    assert bot._loop._provider_signature == original_signature
+
+
+@pytest.mark.asyncio
+async def test_run_model_preset_override_is_per_run(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.providers.factory import ProviderSnapshot
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    original_model = bot._loop.model
+    override_provider = _fake_provider("preset-provider", max_tokens=1024)
+    override = ProviderSnapshot(
+        provider=override_provider,
+        model="openai/gpt-4.1-mini",
+        context_window_tokens=2048,
+        signature=("preset", "fast"),
+    )
+    bot._loop._build_model_preset_snapshot = MagicMock(return_value=override)
+
+    async def fake_process_direct(message, *, session_key):
+        assert bot._loop.provider is override_provider
+        assert bot._loop.model == "openai/gpt-4.1-mini"
+        return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+    bot._loop.process_direct = fake_process_direct
+
+    await bot.run("hi", model_preset="fast")
+
+    bot._loop._build_model_preset_snapshot.assert_called_once_with("fast")
+    assert bot._loop.model == original_model
+    assert bot._loop.model_preset is None
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_multiple_model_selectors(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await bot.run("hi", model="openai/gpt-4.1", model_preset="fast")
+
+
+@pytest.mark.asyncio
 async def test_run_user_hooks_still_fire_alongside_capture(tmp_path):
     """Capture hook must not displace user-provided hooks."""
     from nanobot.agent.hook import AgentHook, AgentHookContext
@@ -503,6 +640,56 @@ async def test_run_streamed_forwards_runtime_options(tmp_path):
     assert kwargs["ephemeral"] is True
     assert callable(kwargs["on_stream"])
     assert callable(kwargs["on_stream_end"])
+
+
+@pytest.mark.asyncio
+async def test_run_streamed_model_override_reports_model_and_restores(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.providers.factory import ProviderSnapshot
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    original_model = bot._loop.model
+    override_provider = _fake_provider("stream-provider", max_tokens=2048)
+    override = ProviderSnapshot(
+        provider=override_provider,
+        model="openai/gpt-4.1-mini",
+        context_window_tokens=4096,
+        signature=("sdk", "stream"),
+    )
+    bot._model_override_snapshot = MagicMock(return_value=override)
+
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
+        assert bot._loop.provider is override_provider
+        assert bot._loop.model == "openai/gpt-4.1-mini"
+        await on_stream("ok")
+        await on_stream_end(resuming=False)
+        return OutboundMessage(channel="cli", chat_id="direct", content="ok")
+
+    bot._loop.process_direct = fake_process_direct
+
+    run = await bot.run_streamed("hi", model="openai/gpt-4.1-mini")
+    events = [event async for event in run.stream_events()]
+    result = await run.wait()
+
+    assert result.content == "ok"
+    assert events[0].type == "run.started"
+    assert events[0].metadata["model"] == "openai/gpt-4.1-mini"
+    assert events[0].metadata["model_preset"] is None
+    assert bot._loop.model == original_model
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_multiple_model_selectors(tmp_path):
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _ = [event async for event in bot.stream(
+            "hi",
+            model="openai/gpt-4.1",
+            model_preset="fast",
+        )]
 
 
 @pytest.mark.asyncio

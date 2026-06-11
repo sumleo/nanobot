@@ -44,6 +44,30 @@ bot = Nanobot.from_config(
 )
 ```
 
+### Choose a default or per-run model
+
+Set the SDK instance default model when you create the bot:
+
+```python
+bot = Nanobot.from_config(model="openai/gpt-4.1")
+```
+
+Override the model for one run without changing the instance default:
+
+```python
+result = await bot.run("Summarize this file", model="openai/gpt-4.1-mini")
+```
+
+Model presets from `config.json` work the same way:
+
+```python
+bot = Nanobot.from_config(model_preset="fast")
+
+result = await bot.run("Think deeply about this bug", model_preset="reasoning")
+```
+
+`model` and `model_preset` are mutually exclusive.
+
 ### Isolate conversations with `session_key`
 
 Different session keys keep independent conversation history:
@@ -142,8 +166,11 @@ Create a `Nanobot` instance from a config file.
 |-------|------|---------|-------------|
 | `config_path` | `str \| Path \| None` | `None` | Path to `config.json`. Defaults to `~/.nanobot/config.json`. |
 | `workspace` | `str \| Path \| None` | `None` | Override the workspace directory from config. |
+| `model` | `str \| None` | `None` | Override the instance default model. |
+| `model_preset` | `str \| None` | `None` | Override the instance default model preset from `config.json`. |
 
 Raises `FileNotFoundError` if an explicit config path does not exist.
+Raises `ValueError` if both `model` and `model_preset` are provided.
 
 ### `await bot.run(...)`
 
@@ -159,6 +186,11 @@ Run the agent once and return a `RunResult`.
 | `media` | `list[str] \| None` | `None` | Optional local media paths attached to the message. |
 | `ephemeral` | `bool` | `False` | Run without persisting the turn or compacting session history. |
 | `hooks` | `list[AgentHook] \| None` | `None` | Lifecycle hooks for this run only. |
+| `model` | `str \| None` | `None` | Override the model for this run only. |
+| `model_preset` | `str \| None` | `None` | Override the model preset for this run only. |
+
+`model` and `model_preset` are per-run overrides and do not change
+`bot.runtime.model` after the run completes. They are mutually exclusive.
 
 ### `await bot.run_streamed(...)`
 
