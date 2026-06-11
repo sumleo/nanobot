@@ -7,13 +7,50 @@ from collections.abc import AsyncIterator, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, SDKCaptureHook
 from nanobot.agent.loop import AgentLoop
 from nanobot.config.schema import Config, ModelPresetConfig
 from nanobot.providers.factory import ProviderSnapshot, build_provider_snapshot
 from nanobot.providers.image_generation import image_gen_provider_configs
+
+StreamEventType: TypeAlias = Literal[
+    "run.started",
+    "text.delta",
+    "text.completed",
+    "reasoning.delta",
+    "reasoning.completed",
+    "tool.started",
+    "tool.completed",
+    "tool.failed",
+    "run.completed",
+    "run.failed",
+]
+
+STREAM_EVENT_RUN_STARTED: StreamEventType = "run.started"
+STREAM_EVENT_TEXT_DELTA: StreamEventType = "text.delta"
+STREAM_EVENT_TEXT_COMPLETED: StreamEventType = "text.completed"
+STREAM_EVENT_REASONING_DELTA: StreamEventType = "reasoning.delta"
+STREAM_EVENT_REASONING_COMPLETED: StreamEventType = "reasoning.completed"
+STREAM_EVENT_TOOL_STARTED: StreamEventType = "tool.started"
+STREAM_EVENT_TOOL_COMPLETED: StreamEventType = "tool.completed"
+STREAM_EVENT_TOOL_FAILED: StreamEventType = "tool.failed"
+STREAM_EVENT_RUN_COMPLETED: StreamEventType = "run.completed"
+STREAM_EVENT_RUN_FAILED: StreamEventType = "run.failed"
+
+STREAM_EVENT_TYPES: tuple[StreamEventType, ...] = (
+    STREAM_EVENT_RUN_STARTED,
+    STREAM_EVENT_TEXT_DELTA,
+    STREAM_EVENT_TEXT_COMPLETED,
+    STREAM_EVENT_REASONING_DELTA,
+    STREAM_EVENT_REASONING_COMPLETED,
+    STREAM_EVENT_TOOL_STARTED,
+    STREAM_EVENT_TOOL_COMPLETED,
+    STREAM_EVENT_TOOL_FAILED,
+    STREAM_EVENT_RUN_COMPLETED,
+    STREAM_EVENT_RUN_FAILED,
+)
 
 
 @dataclass(slots=True)
@@ -33,7 +70,7 @@ class RunResult:
 class StreamEvent:
     """A typed event emitted by ``Nanobot.stream()`` and ``RunStream``."""
 
-    type: str
+    type: StreamEventType
     delta: str = ""
     content: str = ""
     result: RunResult | None = None
@@ -196,7 +233,7 @@ class _SDKStreamEmitter:
             return
         self._text_parts.append(delta)
         await self.emit(StreamEvent(
-            type="text.delta",
+            type=STREAM_EVENT_TEXT_DELTA,
             delta=delta,
             iteration=iteration,
         ))
@@ -213,7 +250,7 @@ class _SDKStreamEmitter:
             return
         self._text_parts = []
         await self.emit(StreamEvent(
-            type="text.completed",
+            type=STREAM_EVENT_TEXT_COMPLETED,
             content=content,
             iteration=iteration,
             resuming=resuming,
@@ -234,7 +271,7 @@ class _SDKStreamingHook(AgentHook):
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         for call in context.tool_calls:
             await self._emitter.emit(StreamEvent(
-                type="tool.started",
+                type=STREAM_EVENT_TOOL_STARTED,
                 name=call.name,
                 tool_call_id=call.id,
                 arguments=deepcopy(call.arguments),
@@ -246,7 +283,7 @@ class _SDKStreamingHook(AgentHook):
             return
         self._reasoning_open = True
         await self._emitter.emit(StreamEvent(
-            type="reasoning.delta",
+            type=STREAM_EVENT_REASONING_DELTA,
             delta=reasoning_content,
         ))
 
@@ -254,7 +291,7 @@ class _SDKStreamingHook(AgentHook):
         if not self._reasoning_open:
             return
         self._reasoning_open = False
-        await self._emitter.emit(StreamEvent(type="reasoning.completed"))
+        await self._emitter.emit(StreamEvent(type=STREAM_EVENT_REASONING_COMPLETED))
 
     async def after_iteration(self, context: AgentHookContext) -> None:
         if not context.tool_events:
@@ -264,7 +301,9 @@ class _SDKStreamingHook(AgentHook):
             event = dict(raw_event)
             status = event.get("status")
             name = str(event.get("name") or (call.name if call else ""))
-            event_type = "tool.completed" if status == "ok" else "tool.failed"
+            event_type = (
+                STREAM_EVENT_TOOL_COMPLETED if status == "ok" else STREAM_EVENT_TOOL_FAILED
+            )
             await self._emitter.emit(StreamEvent(
                 type=event_type,
                 name=name or None,
@@ -691,7 +730,7 @@ class Nanobot:
                     on_stream_end=_on_stream_end,
                 )
                 await emitter.emit(StreamEvent(
-                    type="run.started",
+                    type=STREAM_EVENT_RUN_STARTED,
                     metadata={
                         "session_key": session_key,
                         "channel": channel,
@@ -708,7 +747,7 @@ class Nanobot:
                     await emitter.text_completed(resuming=False, force=False)
                     result = _result_from_response(response, capture)
                     await emitter.emit(StreamEvent(
-                        type="run.completed",
+                        type=STREAM_EVENT_RUN_COMPLETED,
                         content=result.content,
                         result=result,
                         usage=dict(result.usage),
@@ -717,7 +756,7 @@ class Nanobot:
                     return result
                 except Exception as exc:
                     await emitter.emit(StreamEvent(
-                        type="run.failed",
+                        type=STREAM_EVENT_RUN_FAILED,
                         error=str(exc),
                         metadata={"exception_type": type(exc).__name__},
                     ))

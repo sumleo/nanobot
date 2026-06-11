@@ -83,22 +83,30 @@ Use `bot.stream()` when you want Cursor/OpenAI-style live events instead of
 waiting for the final `RunResult`:
 
 ```python
+from nanobot import (
+    STREAM_EVENT_RUN_COMPLETED,
+    STREAM_EVENT_TEXT_DELTA,
+    STREAM_EVENT_TOOL_STARTED,
+)
+
 async for event in bot.stream("Review this repository"):
-    if event.type == "text.delta":
+    if event.type == STREAM_EVENT_TEXT_DELTA:
         print(event.delta, end="", flush=True)
-    elif event.type == "tool.started":
+    elif event.type == STREAM_EVENT_TOOL_STARTED:
         print(f"\nusing {event.name}")
-    elif event.type == "run.completed":
+    elif event.type == STREAM_EVENT_RUN_COMPLETED:
         print("\nfinal:", event.result.content)
 ```
 
 Use `run_streamed()` when you also want a handle you can wait on:
 
 ```python
+from nanobot import STREAM_EVENT_TEXT_DELTA
+
 run = await bot.run_streamed("Write a detailed migration plan")
 
 async for event in run.stream_events():
-    if event.type == "text.delta":
+    if event.type == STREAM_EVENT_TEXT_DELTA:
         print(event.delta, end="", flush=True)
 
 result = await run.wait()
@@ -228,7 +236,7 @@ async for event in bot.stream("Generate a long answer"):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | `str` | Event type, such as `text.delta` or `run.completed`. |
+| `type` | `StreamEventType` | Event type, such as `text.delta` or `run.completed`. |
 | `delta` | `str` | Incremental text or reasoning chunk. |
 | `content` | `str` | Completed text segment or final content. |
 | `result` | `RunResult \| None` | Present on `run.completed`. |
@@ -241,20 +249,22 @@ async for event in bot.stream("Generate a long answer"):
 | `error` | `str \| None` | Error text on failed events. |
 | `metadata` | `dict` | Additional event metadata. |
 
-Event types:
+Use the exported constants instead of hard-coded strings when possible:
 
-```text
-run.started
-text.delta
-text.completed
-reasoning.delta
-reasoning.completed
-tool.started
-tool.completed
-tool.failed
-run.completed
-run.failed
-```
+| Constant | Value |
+|----------|-------|
+| `STREAM_EVENT_RUN_STARTED` | `run.started` |
+| `STREAM_EVENT_TEXT_DELTA` | `text.delta` |
+| `STREAM_EVENT_TEXT_COMPLETED` | `text.completed` |
+| `STREAM_EVENT_REASONING_DELTA` | `reasoning.delta` |
+| `STREAM_EVENT_REASONING_COMPLETED` | `reasoning.completed` |
+| `STREAM_EVENT_TOOL_STARTED` | `tool.started` |
+| `STREAM_EVENT_TOOL_COMPLETED` | `tool.completed` |
+| `STREAM_EVENT_TOOL_FAILED` | `tool.failed` |
+| `STREAM_EVENT_RUN_COMPLETED` | `run.completed` |
+| `STREAM_EVENT_RUN_FAILED` | `run.failed` |
+
+`STREAM_EVENT_TYPES` contains all stable v1 event values.
 
 ### `await bot.aclose()`
 

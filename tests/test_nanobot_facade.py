@@ -9,7 +9,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.nanobot import Nanobot, RunResult, RunStream, SessionInfo, SessionSnapshot, StreamEvent
+from nanobot.nanobot import (
+    STREAM_EVENT_REASONING_COMPLETED,
+    STREAM_EVENT_REASONING_DELTA,
+    STREAM_EVENT_RUN_COMPLETED,
+    STREAM_EVENT_RUN_FAILED,
+    STREAM_EVENT_RUN_STARTED,
+    STREAM_EVENT_TEXT_COMPLETED,
+    STREAM_EVENT_TEXT_DELTA,
+    STREAM_EVENT_TOOL_COMPLETED,
+    STREAM_EVENT_TOOL_FAILED,
+    STREAM_EVENT_TOOL_STARTED,
+    STREAM_EVENT_TYPES,
+    Nanobot,
+    RunResult,
+    RunStream,
+    SessionInfo,
+    SessionSnapshot,
+    StreamEvent,
+    StreamEventType,
+)
 
 
 def _write_config(tmp_path: Path, overrides: dict | None = None) -> Path:
@@ -227,6 +246,38 @@ def test_import_from_top_level():
     assert nanobot.SessionInfo is SessionInfo
     assert nanobot.SessionSnapshot is SessionSnapshot
     assert nanobot.StreamEvent is StreamEvent
+    assert nanobot.StreamEventType is StreamEventType
+    assert nanobot.STREAM_EVENT_TEXT_DELTA == STREAM_EVENT_TEXT_DELTA
+    assert nanobot.STREAM_EVENT_RUN_COMPLETED == STREAM_EVENT_RUN_COMPLETED
+    assert nanobot.STREAM_EVENT_TYPES == STREAM_EVENT_TYPES
+
+
+def test_stream_event_constants_are_stable():
+    assert STREAM_EVENT_TYPES == (
+        STREAM_EVENT_RUN_STARTED,
+        STREAM_EVENT_TEXT_DELTA,
+        STREAM_EVENT_TEXT_COMPLETED,
+        STREAM_EVENT_REASONING_DELTA,
+        STREAM_EVENT_REASONING_COMPLETED,
+        STREAM_EVENT_TOOL_STARTED,
+        STREAM_EVENT_TOOL_COMPLETED,
+        STREAM_EVENT_TOOL_FAILED,
+        STREAM_EVENT_RUN_COMPLETED,
+        STREAM_EVENT_RUN_FAILED,
+    )
+    assert STREAM_EVENT_TYPES == (
+        "run.started",
+        "text.delta",
+        "text.completed",
+        "reasoning.delta",
+        "reasoning.completed",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+        "run.completed",
+        "run.failed",
+    )
+    assert len(set(STREAM_EVENT_TYPES)) == len(STREAM_EVENT_TYPES)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +587,7 @@ async def test_stream_yields_text_events_in_order(tmp_path):
 
     events = [event async for event in bot.stream("hi")]
 
+    assert all(event.type in STREAM_EVENT_TYPES for event in events)
     assert [event.type for event in events] == [
         "run.started",
         "text.delta",
