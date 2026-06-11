@@ -53,6 +53,33 @@ await bot.run("hi", session_key="user-alice")
 await bot.run("hi", session_key="task-42")
 ```
 
+### Stream long-running output
+
+Use `bot.stream()` when you want Cursor/OpenAI-style live events instead of
+waiting for the final `RunResult`:
+
+```python
+async for event in bot.stream("Review this repository"):
+    if event.type == "text.delta":
+        print(event.delta, end="", flush=True)
+    elif event.type == "tool.started":
+        print(f"\nusing {event.name}")
+    elif event.type == "run.completed":
+        print("\nfinal:", event.result.content)
+```
+
+Use `run_streamed()` when you also want a handle you can wait on:
+
+```python
+run = await bot.run_streamed("Write a detailed migration plan")
+
+async for event in run.stream_events():
+    if event.type == "text.delta":
+        print(event.delta, end="", flush=True)
+
+result = await run.wait()
+```
+
 ### Import an existing transcript
 
 Use `bot.sessions.ingest()` when you already have a transcript and want it to
@@ -132,6 +159,70 @@ Run the agent once and return a `RunResult`.
 | `media` | `list[str] \| None` | `None` | Optional local media paths attached to the message. |
 | `ephemeral` | `bool` | `False` | Run without persisting the turn or compacting session history. |
 | `hooks` | `list[AgentHook] \| None` | `None` | Lifecycle hooks for this run only. |
+
+### `await bot.run_streamed(...)`
+
+Start a streamed agent turn and return a `RunStream`. It accepts the same
+parameters as `bot.run(...)`.
+
+```python
+run = await bot.run_streamed("Generate a long answer")
+
+async for event in run.stream_events():
+    ...
+
+result = await run.wait()
+```
+
+### `bot.stream(...)`
+
+Convenience wrapper around `run_streamed()` for direct event iteration. It
+accepts the same parameters as `bot.run(...)`.
+
+```python
+async for event in bot.stream("Generate a long answer"):
+    ...
+```
+
+### `RunStream`
+
+| Method | Description |
+|--------|-------------|
+| `stream_events()` | Single-consumer async iterator of `StreamEvent` objects. |
+| `await wait()` | Wait for the run to finish and return `RunResult`. |
+| `await text()` | Wait for the run to finish and return `RunResult.content`. |
+
+### `StreamEvent`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `str` | Event type, such as `text.delta` or `run.completed`. |
+| `delta` | `str` | Incremental text or reasoning chunk. |
+| `content` | `str` | Completed text segment or final content. |
+| `result` | `RunResult \| None` | Present on `run.completed`. |
+| `name` | `str \| None` | Tool name for tool events. |
+| `tool_call_id` | `str \| None` | Provider tool call id when available. |
+| `arguments` | `dict \| None` | Tool arguments when available. |
+| `iteration` | `int \| None` | Agent loop iteration when available. |
+| `resuming` | `bool \| None` | Whether a text segment ended before more tool work. |
+| `usage` | `dict[str, int]` | Token usage on completion events. |
+| `error` | `str \| None` | Error text on failed events. |
+| `metadata` | `dict` | Additional event metadata. |
+
+Event types:
+
+```text
+run.started
+text.delta
+text.completed
+reasoning.delta
+reasoning.completed
+tool.started
+tool.completed
+tool.failed
+run.completed
+run.failed
+```
 
 ### `await bot.aclose()`
 
