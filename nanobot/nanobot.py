@@ -503,6 +503,7 @@ class Nanobot:
             kwargs["media"] = media
         if ephemeral:
             kwargs["ephemeral"] = True
+            kwargs["_run_extra_hooks_for_ephemeral"] = True
         if on_stream is not None:
             kwargs["on_stream"] = on_stream
         if on_stream_end is not None:

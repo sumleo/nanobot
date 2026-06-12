@@ -406,6 +406,33 @@ async def test_run_populates_observability_fields(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_ephemeral_still_captures_runner_observability(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.queue import MessageBus
+    from nanobot.providers.base import LLMResponse
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content="done",
+        tool_calls=[],
+        usage={"total_tokens": 3},
+    ))
+    bot = Nanobot(AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+    ))
+
+    result = await bot.run("hi", ephemeral=True)
+
+    assert result.content == "done"
+    assert result.usage["total_tokens"] == 3
+    assert result.usage["provider_tokens"] == 3
+
+
+@pytest.mark.asyncio
 async def test_run_forwards_non_default_runtime_options(tmp_path):
     from nanobot.bus.events import OutboundMessage
 
@@ -433,6 +460,7 @@ async def test_run_forwards_non_default_runtime_options(tmp_path):
         sender_id="alice",
         media=["/tmp/image.png"],
         ephemeral=True,
+        _run_extra_hooks_for_ephemeral=True,
     )
 
 
